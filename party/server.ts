@@ -14,10 +14,12 @@ import { generateSessionToken } from "../src/session.js";
 import { DEFAULT_SETTINGS } from "../src/constants.js";
 
 type ConnectionMap = Map<string, { sessionToken: string; playerId: string }>;
+const RECONNECT_GRACE_MS = 10_000;
 
 export default class DinoGamesServer implements Party.Server {
   gameType: GameType | null = null;
   connections: ConnectionMap = new Map();
+  pendingDisconnects: Map<string, ReturnType<typeof setTimeout>> = new Map();
   
   // Game handlers
   pokerHandler: PokerGameHandler | null = null;
@@ -76,7 +78,7 @@ export default class DinoGamesServer implements Party.Server {
 
   onClose(conn: Party.Connection) {
     console.log(`Connection closed: ${conn.id}`);
-    this.handleDisconnect(conn);
+    this.scheduleDisconnect(conn.id);
   }
 
   // --- Join Handler ---
@@ -93,7 +95,8 @@ export default class DinoGamesServer implements Party.Server {
     if (sessionToken && this.gameType) {
       const existingPlayer = this.findPlayerByToken(sessionToken);
       if (existingPlayer) {
-        this.connections.set(conn.id, { sessionToken, playerId: existingPlayer.id });
+        this.clearPendingDisconnect(sessionToken);
+        this.connections.set(conn.id, { sessionToken, playerId: conn.id });
         this.updatePlayerId(sessionToken, conn.id);
         
         conn.send(JSON.stringify({ 
@@ -139,6 +142,7 @@ export default class DinoGamesServer implements Party.Server {
     const newSessionToken = generateSessionToken();
     const playerName = trimmedName || `Dino${this.getPlayerCount() + 1}`;
     
+    this.clearPendingDisconnect(newSessionToken);
     this.addPlayer(conn.id, playerName, newSessionToken);
     this.connections.set(conn.id, { sessionToken: newSessionToken, playerId: conn.id });
 
@@ -349,23 +353,64 @@ export default class DinoGamesServer implements Party.Server {
     }
   }
 
-  private handleDisconnect(conn: Party.Connection): void {
-    this.connections.delete(conn.id);
-    
+  private handleDisconnect(playerId: string): void {
     switch (this.gameType) {
       case "poker":
-        this.pokerHandler?.handleDisconnect(conn.id);
+        this.pokerHandler?.handleDisconnect(playerId);
         break;
       case "pictionary":
-        this.pictionaryHandler?.handleDisconnect(conn.id);
+        this.pictionaryHandler?.handleDisconnect(playerId);
         break;
       case "codenames":
-        this.codenamesHandler?.handleDisconnect(conn.id);
+        this.codenamesHandler?.handleDisconnect(playerId);
         break;
     }
 
-    this.room.broadcast(JSON.stringify({ type: "player-left", playerId: conn.id }));
-    this.broadcastState();
+    this.room.broadcast(JSON.stringify({ type: "player-left", playerId }));
+    void this.broadcastState();
+  }
+
+  private scheduleDisconnect(connectionId: string): void {
+    const connection = this.connections.get(connectionId);
+    if (!connection) return;
+
+    this.connections.delete(connectionId);
+    this.clearPendingDisconnect(connection.sessionToken);
+
+    const timeout = setTimeout(() => {
+      this.finalizeDisconnect(connection.sessionToken);
+    }, RECONNECT_GRACE_MS);
+
+    this.pendingDisconnects.set(connection.sessionToken, timeout);
+  }
+
+  private clearPendingDisconnect(sessionToken: string): void {
+    const timeout = this.pendingDisconnects.get(sessionToken);
+    if (!timeout) return;
+    clearTimeout(timeout);
+    this.pendingDisconnects.delete(sessionToken);
+  }
+
+  private hasActiveConnection(sessionToken: string): boolean {
+    for (const connection of this.connections.values()) {
+      if (connection.sessionToken === sessionToken) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private finalizeDisconnect(sessionToken: string): void {
+    this.pendingDisconnects.delete(sessionToken);
+
+    if (this.hasActiveConnection(sessionToken)) {
+      return;
+    }
+
+    const player = this.findPlayerByToken(sessionToken);
+    if (!player) return;
+
+    this.handleDisconnect(player.id);
   }
 
   private pruneDisconnectedPlayers(): void {
@@ -375,7 +420,9 @@ export default class DinoGamesServer implements Party.Server {
       case "poker": {
         const state = this.pokerHandler?.getState();
         if (state) {
-          const disconnected = state.players.filter(p => !connectedIds.has(p.id));
+          const disconnected = state.players.filter(
+            p => !connectedIds.has(p.id) && !this.pendingDisconnects.has(p.sessionToken)
+          );
           for (const player of disconnected) {
             this.pokerHandler?.removePlayer(player.id);
           }

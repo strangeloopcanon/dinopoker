@@ -53,7 +53,14 @@ export class CodenamesGameHandler {
 
   updatePlayerId(token: string, newId: string): void {
     const player = this.state.players.find(p => p.sessionToken === token);
-    if (player) player.id = newId;
+    if (!player) return;
+
+    const previousId = player.id;
+    player.id = newId;
+
+    if (this.state.clueGiverId === previousId) {
+      this.state.clueGiverId = newId;
+    }
   }
 
   addPlayer(id: string, name: string, sessionToken: string): void {

@@ -53,7 +53,20 @@ export class PictionaryGameHandler {
 
   updatePlayerId(token: string, newId: string): void {
     const player = this.state.players.find(p => p.sessionToken === token);
-    if (player) player.id = newId;
+    if (!player) return;
+
+    const previousId = player.id;
+    player.id = newId;
+
+    if (this.state.currentDrawerId === previousId) {
+      this.state.currentDrawerId = newId;
+    }
+
+    this.state.guesses = this.state.guesses.map(guess =>
+      guess.playerId === previousId
+        ? { ...guess, playerId: newId }
+        : guess
+    );
   }
 
   addPlayer(id: string, name: string, sessionToken: string): void {
