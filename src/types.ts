@@ -1,4 +1,7 @@
-// Game phases - state machine states
+// Available game types
+export type GameType = "poker" | "pictionary" | "codenames";
+
+// Game phases - state machine states (poker)
 export type GamePhase = 
   | "lobby"      // Waiting for players, game not started
   | "preflop"    // Cards dealt, first betting round
@@ -6,6 +9,29 @@ export type GamePhase =
   | "turn"       // 4th community card
   | "river"      // 5th community card
   | "showdown";  // Reveal hands, determine winner
+
+// Pictionary phases
+export type PictionaryPhase = 
+  | "lobby"
+  | "picking"    // Drawer is picking a word
+  | "drawing"    // Active drawing round
+  | "reveal"     // Show the word
+  | "ended";
+
+// Codenames phases
+export type CodenamesPhase =
+  | "lobby"
+  | "playing"    // Game in progress
+  | "won"
+  | "lost";
+
+// Base player info (shared across games)
+export interface BasePlayer {
+  id: string;
+  name: string;
+  sessionToken: string;
+  score: number;
+}
 
 // Card representation
 export interface Card {
@@ -139,3 +165,149 @@ export interface HandEvaluation {
   rank: number;         // Higher is better
   cards: Card[];        // The 5 cards that make the hand
 }
+
+// ============================================
+// PICTIONARY TYPES
+// ============================================
+
+export interface PictionaryPlayer extends BasePlayer {
+  isDrawing: boolean;
+}
+
+export type PublicPictionaryPlayer = Omit<PictionaryPlayer, "sessionToken">;
+
+export interface DrawStroke {
+  points: Array<{ x: number; y: number }>;
+  color: string;
+  width: number;
+}
+
+export interface PictionaryState {
+  phase: PictionaryPhase;
+  players: PictionaryPlayer[];
+  currentWord: string;           // Only shown to drawer
+  currentDrawerId: string | null;
+  strokes: DrawStroke[];
+  roundTimeLeft: number;         // Seconds
+  roundNumber: number;
+  totalRounds: number;
+  guesses: Array<{ playerId: string; name: string; guess: string; correct: boolean }>;
+  wordChoices: string[];         // 3 options for drawer to pick from
+}
+
+export interface PublicPictionaryState {
+  phase: PictionaryPhase;
+  players: PublicPictionaryPlayer[];
+  currentDrawerId: string | null;
+  strokes: DrawStroke[];
+  roundTimeLeft: number;
+  roundNumber: number;
+  totalRounds: number;
+  guesses: Array<{ playerId: string; name: string; guess: string; correct: boolean }>;
+  wordLength: number;            // Hint: number of characters
+  wordChoices?: string[];        // Only sent to drawer during picking phase
+}
+
+// Pictionary messages
+export type PictionaryClientMessage =
+  | { type: "join"; name: string; gameType: "pictionary"; sessionToken?: string }
+  | { type: "start-game" }
+  | { type: "pick-word"; word: string }
+  | { type: "draw"; stroke: DrawStroke }
+  | { type: "clear-canvas" }
+  | { type: "guess"; text: string }
+  | { type: "next-round" };
+
+export type PictionaryServerMessage =
+  | { type: "welcome"; playerId: string; sessionToken: string; gameType: "pictionary" }
+  | { type: "error"; message: string }
+  | { type: "game-state"; state: PublicPictionaryState; currentWord?: string }
+  | { type: "player-joined"; player: PublicPictionaryPlayer }
+  | { type: "player-left"; playerId: string }
+  | { type: "draw"; stroke: DrawStroke }
+  | { type: "clear-canvas" }
+  | { type: "guess"; playerId: string; name: string; guess: string; correct: boolean }
+  | { type: "round-end"; word: string; winnerId: string | null }
+  | { type: "game-end"; winner: PublicPictionaryPlayer };
+
+// ============================================
+// CODENAMES TYPES
+// ============================================
+
+export type CodenamesCardType = "green" | "neutral" | "assassin";
+
+export interface CodenamesCard {
+  word: string;
+  type: CodenamesCardType;  // What this card actually is
+  revealed: boolean;
+}
+
+export interface CodenamesPlayer extends BasePlayer {
+  // In duet, all players work together
+}
+
+export type PublicCodenamesPlayer = Omit<CodenamesPlayer, "sessionToken">;
+
+export interface CodenamesState {
+  phase: CodenamesPhase;
+  players: CodenamesPlayer[];
+  board: CodenamesCard[];        // 25 cards (5x5)
+  currentClue: { word: string; count: number } | null;
+  guessesRemaining: number;
+  turnsRemaining: number;
+  greenRemaining: number;        // How many green cards left to find
+  isClueGiver: boolean;          // Current player giving clue or guessing
+  clueGiverId: string | null;    // Which player can see the full board
+}
+
+export interface PublicCodenamesState {
+  phase: CodenamesPhase;
+  players: PublicCodenamesPlayer[];
+  board: Array<{
+    word: string;
+    revealed: boolean;
+    type?: CodenamesCardType;    // Only shown if revealed
+  }>;
+  currentClue: { word: string; count: number } | null;
+  guessesRemaining: number;
+  turnsRemaining: number;
+  greenRemaining: number;
+}
+
+// Codenames messages
+export type CodenamesClientMessage =
+  | { type: "join"; name: string; gameType: "codenames"; sessionToken?: string }
+  | { type: "start-game" }
+  | { type: "give-clue"; word: string; count: number }
+  | { type: "guess"; cardIndex: number }
+  | { type: "end-turn" }
+  | { type: "new-game" };
+
+export type CodenamesServerMessage =
+  | { type: "welcome"; playerId: string; sessionToken: string; gameType: "codenames" }
+  | { type: "error"; message: string }
+  | { type: "game-state"; state: PublicCodenamesState; fullBoard?: CodenamesCard[] }
+  | { type: "player-joined"; player: PublicCodenamesPlayer }
+  | { type: "player-left"; playerId: string }
+  | { type: "clue-given"; word: string; count: number }
+  | { type: "card-revealed"; cardIndex: number; cardType: CodenamesCardType }
+  | { type: "game-over"; won: boolean };
+
+// ============================================
+// UNIFIED MESSAGE TYPES
+// ============================================
+
+export type UnifiedClientMessage =
+  | { type: "join"; name: string; gameType?: GameType; sessionToken?: string }
+  | { type: "start-game" }
+  | { type: "action"; action: PlayerAction }  // Poker
+  | { type: "new-hand" }                      // Poker
+  | PictionaryClientMessage
+  | CodenamesClientMessage;
+
+export type UnifiedServerMessage =
+  | { type: "welcome"; playerId: string; sessionToken: string; gameType: GameType }
+  | { type: "room-info"; gameType: GameType; playerCount: number }
+  | ServerMessage
+  | PictionaryServerMessage
+  | CodenamesServerMessage;

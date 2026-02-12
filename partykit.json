@@ -1,5 +1,5 @@
 {
-  "name": "dinopoker",
+  "name": "dinogames",
   "main": "party/server.ts",
   "serve": "./public",
   "compatibilityDate": "2026-02-11"

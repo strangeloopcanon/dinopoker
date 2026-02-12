@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#2c1810">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>Cretaceous Hold'em</title>
+  <title>Dino Games</title>
   <link rel="stylesheet" href="styles.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦖</text></svg>">
 </head>
@@ -15,8 +15,8 @@
     <!-- Join Screen -->
     <div id="join-screen" class="screen active">
       <div class="logo">🦖</div>
-      <h1>Cretaceous Hold'em</h1>
-      <p class="subtitle">Dinosaur Poker</p>
+      <h1>Dino Games</h1>
+      <p class="subtitle">Prehistoric Party Games</p>
       
       <div class="join-form">
         <input 
@@ -38,6 +38,28 @@
           style="text-transform: uppercase;"
         >
         
+        <!-- Game Selection (only shown when creating room) -->
+        <div id="game-selector" class="game-selector">
+          <p class="selector-label">Pick a game:</p>
+          <div class="game-options">
+            <button class="game-option selected" data-game="poker">
+              <span class="game-icon">🃏</span>
+              <span class="game-name">Poker</span>
+              <span class="game-desc">Hold'em</span>
+            </button>
+            <button class="game-option" data-game="pictionary">
+              <span class="game-icon">🎨</span>
+              <span class="game-name">Pictionary</span>
+              <span class="game-desc">Draw & Guess</span>
+            </button>
+            <button class="game-option" data-game="codenames">
+              <span class="game-icon">🔍</span>
+              <span class="game-name">Codenames</span>
+              <span class="game-desc">Duet</span>
+            </button>
+          </div>
+        </div>
+        
         <button id="join-btn" class="btn primary">Join Game</button>
         
         <p id="connection-status" class="status"></p>
@@ -50,6 +72,7 @@
         <p class="label">Room Code</p>
         <div id="room-code-display"></div>
       </div>
+      <div id="game-type-display" class="game-type-badge"></div>
       <p class="subtitle">Waiting for players...</p>
       
       <div id="lobby-players" class="player-list"></div>
@@ -61,7 +84,11 @@
       <p class="hint">Share the room code with others to join</p>
     </div>
     
-    <!-- Game Screen -->
+    <!-- ======================= -->
+    <!-- POKER SCREENS -->
+    <!-- ======================= -->
+    
+    <!-- Poker Game Screen -->
     <div id="game-screen" class="screen">
       <!-- Community Cards -->
       <div id="community-area">
@@ -99,7 +126,7 @@
       <div id="game-status"></div>
     </div>
     
-    <!-- Showdown Screen -->
+    <!-- Poker Showdown Screen -->
     <div id="showdown-screen" class="screen">
       <div class="showdown-header">
         <div class="trophy">🏆</div>
@@ -107,6 +134,118 @@
       </div>
       <div id="showdown-results"></div>
       <button id="next-hand-btn" class="btn primary">Next Hand</button>
+    </div>
+    
+    <!-- ======================= -->
+    <!-- PICTIONARY SCREENS -->
+    <!-- ======================= -->
+    
+    <div id="pictionary-screen" class="screen">
+      <!-- Header -->
+      <div class="pictionary-header">
+        <div class="round-info">
+          <span>Round <span id="pict-round">1</span>/<span id="pict-total-rounds">1</span></span>
+        </div>
+        <div id="pict-timer" class="timer">60</div>
+      </div>
+      
+      <!-- Word Display (for drawer) -->
+      <div id="pict-word-display" class="word-display hidden">
+        <span class="label">Draw:</span>
+        <span id="pict-current-word" class="current-word"></span>
+      </div>
+      
+      <!-- Word Hint (for guessers) -->
+      <div id="pict-word-hint" class="word-hint hidden">
+        <span id="pict-word-blanks"></span>
+      </div>
+      
+      <!-- Word Picker -->
+      <div id="pict-word-picker" class="word-picker hidden">
+        <p>Pick a word to draw:</p>
+        <div id="pict-word-choices" class="word-choices"></div>
+      </div>
+      
+      <!-- Canvas Area -->
+      <div class="canvas-container">
+        <canvas id="pict-canvas" width="400" height="300"></canvas>
+        <div id="pict-draw-tools" class="draw-tools hidden">
+          <button class="tool-btn color-btn" data-color="#000000" style="background:#000"></button>
+          <button class="tool-btn color-btn" data-color="#e94560" style="background:#e94560"></button>
+          <button class="tool-btn color-btn" data-color="#0f3460" style="background:#0f3460"></button>
+          <button class="tool-btn color-btn" data-color="#4ade80" style="background:#4ade80"></button>
+          <button class="tool-btn" id="pict-clear-btn">Clear</button>
+        </div>
+      </div>
+      
+      <!-- Guessing Area -->
+      <div id="pict-guess-area" class="guess-area hidden">
+        <div id="pict-guesses" class="guesses-list"></div>
+        <div class="guess-input-row">
+          <input type="text" id="pict-guess-input" placeholder="Type your guess..." autocomplete="off">
+          <button id="pict-guess-btn" class="btn primary">Guess</button>
+        </div>
+      </div>
+      
+      <!-- Scoreboard -->
+      <div id="pict-scoreboard" class="scoreboard"></div>
+      
+      <!-- Round End -->
+      <div id="pict-round-end" class="round-end hidden">
+        <p>The word was: <strong id="pict-revealed-word"></strong></p>
+        <button id="pict-next-round-btn" class="btn primary">Next Round</button>
+      </div>
+    </div>
+    
+    <!-- ======================= -->
+    <!-- CODENAMES SCREENS -->
+    <!-- ======================= -->
+    
+    <div id="codenames-screen" class="screen">
+      <!-- Header -->
+      <div class="codenames-header">
+        <div class="turns-remaining">
+          <span>Turns: <span id="cn-turns">9</span></span>
+        </div>
+        <div class="green-remaining">
+          <span>Agents: <span id="cn-green">15</span></span>
+        </div>
+      </div>
+      
+      <!-- Current Clue -->
+      <div id="cn-clue-display" class="clue-display hidden">
+        <span class="clue-word" id="cn-clue-word"></span>
+        <span class="clue-count" id="cn-clue-count"></span>
+        <span class="guesses-left">(<span id="cn-guesses-left">0</span> guesses left)</span>
+      </div>
+      
+      <!-- Word Grid -->
+      <div id="cn-board" class="codenames-board"></div>
+      
+      <!-- Clue Giver Controls -->
+      <div id="cn-clue-controls" class="clue-controls hidden">
+        <p>Give a one-word clue:</p>
+        <div class="clue-input-row">
+          <input type="text" id="cn-clue-input" placeholder="Clue word" autocomplete="off">
+          <input type="number" id="cn-clue-number" placeholder="#" min="1" max="9" value="1">
+          <button id="cn-give-clue-btn" class="btn primary">Give Clue</button>
+        </div>
+      </div>
+      
+      <!-- Guesser Controls -->
+      <div id="cn-guess-controls" class="guess-controls hidden">
+        <p>Tap cards to guess, or:</p>
+        <button id="cn-end-turn-btn" class="btn secondary">End Turn</button>
+      </div>
+      
+      <!-- Game Over -->
+      <div id="cn-game-over" class="game-over hidden">
+        <h2 id="cn-game-result"></h2>
+        <button id="cn-new-game-btn" class="btn primary">New Game</button>
+      </div>
+      
+      <!-- Players -->
+      <div id="cn-players" class="codenames-players"></div>
     </div>
   </div>
   

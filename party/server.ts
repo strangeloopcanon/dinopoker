@@ -1,438 +1,432 @@
 import type * as Party from "partykit/server";
 import type { 
-  GameState, 
-  ClientMessage, 
-  ServerMessage, 
-  Player, 
+  GameType,
+  UnifiedClientMessage,
+  ServerMessage,
+  Player,
   PlayerAction,
-  Card
+  BasePlayer
 } from "../src/types.js";
-import { 
-  createInitialState, 
-  startNewHand, 
-  applyAction, 
-  advanceStreet,
-  shouldAdvancePhase,
-  getLegalActions,
-  toPublicState,
-  countActivePlayers
-} from "../src/game-state.js";
-import { runShowdown, shouldAutoShowdown, runOutBoard } from "../src/showdown.js";
+import { PokerGameHandler } from "./games/poker.js";
+import { PictionaryGameHandler } from "./games/pictionary.js";
+import { CodenamesGameHandler } from "./games/codenames.js";
 import { generateSessionToken } from "../src/session.js";
 import { DEFAULT_SETTINGS } from "../src/constants.js";
 
-// Map connection ID to session token for reconnection
 type ConnectionMap = Map<string, { sessionToken: string; playerId: string }>;
 
-export default class DinoPokerServer implements Party.Server {
-  state: GameState;
-  connections: ConnectionMap;
+export default class DinoGamesServer implements Party.Server {
+  gameType: GameType | null = null;
+  connections: ConnectionMap = new Map();
+  
+  // Game handlers
+  pokerHandler: PokerGameHandler | null = null;
+  pictionaryHandler: PictionaryGameHandler | null = null;
+  codenamesHandler: CodenamesGameHandler | null = null;
 
-  constructor(readonly room: Party.Room) {
-    this.state = createInitialState();
-    this.connections = new Map();
-  }
+  constructor(readonly room: Party.Room) {}
 
   onConnect(conn: Party.Connection, ctx: Party.ConnectionContext) {
     console.log(`Connection opened: ${conn.id}`);
-    // Don't add to game yet - wait for join message
+    // Send room info if game type is set
+    if (this.gameType) {
+      conn.send(JSON.stringify({
+        type: "room-info",
+        gameType: this.gameType,
+        playerCount: this.getPlayerCount(),
+      }));
+    }
   }
 
   async onMessage(message: string, sender: Party.Connection) {
-    let msg: ClientMessage;
+    let msg: UnifiedClientMessage;
     try {
       msg = JSON.parse(message);
     } catch {
-      this.sendToConnection(sender, { type: "error", message: "Invalid message format" });
+      sender.send(JSON.stringify({ type: "error", message: "Invalid message format" }));
       return;
     }
 
     console.log(`Message from ${sender.id}:`, msg.type);
 
-    switch (msg.type) {
-      case "join":
-        await this.handleJoin(sender, msg.name, msg.sessionToken);
+    // Handle join - this sets the game type for the room
+    if (msg.type === "join") {
+      await this.handleJoin(sender, msg.name, msg.gameType, msg.sessionToken);
+      return;
+    }
+
+    // Route to appropriate game handler
+    if (!this.gameType) {
+      sender.send(JSON.stringify({ type: "error", message: "No game selected" }));
+      return;
+    }
+
+    switch (this.gameType) {
+      case "poker":
+        await this.handlePokerMessage(msg, sender);
         break;
-      case "start-game":
-        await this.handleStartGame(sender);
+      case "pictionary":
+        await this.handlePictionaryMessage(msg, sender);
         break;
-      case "action":
-        await this.handleAction(sender, msg.action);
-        break;
-      case "new-hand":
-        await this.handleNewHand(sender);
+      case "codenames":
+        await this.handleCodenamesMessage(msg, sender);
         break;
     }
   }
 
   onClose(conn: Party.Connection) {
     console.log(`Connection closed: ${conn.id}`);
-    void this.handleDisconnect(conn);
+    this.handleDisconnect(conn);
   }
 
-  // --- Message Handlers ---
+  // --- Join Handler ---
 
-  private async handleJoin(conn: Party.Connection, name: string, sessionToken?: string) {
+  private async handleJoin(
+    conn: Party.Connection, 
+    name: string, 
+    gameType?: GameType,
+    sessionToken?: string
+  ) {
     const trimmedName = name.trim();
 
     // Check for reconnection
-    if (sessionToken) {
-      const existingPlayer = this.state.players.find(p => p.sessionToken === sessionToken);
+    if (sessionToken && this.gameType) {
+      const existingPlayer = this.findPlayerByToken(sessionToken);
       if (existingPlayer) {
-        // Reconnecting player
         this.connections.set(conn.id, { sessionToken, playerId: existingPlayer.id });
+        this.updatePlayerId(sessionToken, conn.id);
         
-        // Update player's connection
-        existingPlayer.id = conn.id;
-        
-        this.sendToConnection(conn, { 
+        conn.send(JSON.stringify({ 
           type: "welcome", 
           playerId: conn.id,
-          sessionToken 
-        });
+          sessionToken,
+          gameType: this.gameType
+        }));
         
         await this.broadcastState();
         return;
       }
     }
 
-    // New player
-    if (this.state.phase !== "lobby") {
-      this.sendToConnection(conn, { 
-        type: "error", 
-        message: "Game already in progress" 
-      });
+    // New room - set game type
+    if (!this.gameType) {
+      if (!gameType) {
+        conn.send(JSON.stringify({ type: "error", message: "Please select a game type" }));
+        return;
+      }
+      this.gameType = gameType;
+      this.initializeGameHandler(gameType);
+    }
+
+    // Check if game allows more players
+    if (!this.canAddPlayer()) {
+      conn.send(JSON.stringify({ type: "error", message: "Game is full" }));
       return;
     }
 
-    if (this.state.players.length >= DEFAULT_SETTINGS.maxPlayers) {
-      this.sendToConnection(conn, { 
-        type: "error", 
-        message: "Game is full" 
-      });
+    // Check if in lobby
+    if (!this.isInLobby()) {
+      conn.send(JSON.stringify({ type: "error", message: "Game already in progress" }));
       return;
     }
 
     // Check for duplicate name
-    if (trimmedName && this.state.players.some(p => p.name === trimmedName)) {
-      this.sendToConnection(conn, { 
-        type: "error", 
-        message: "Name already taken" 
-      });
+    if (trimmedName && this.isNameTaken(trimmedName)) {
+      conn.send(JSON.stringify({ type: "error", message: "Name already taken" }));
       return;
     }
 
     const newSessionToken = generateSessionToken();
-    const newPlayer: Player = {
-      id: conn.id,
-      name: trimmedName || `Dino${this.state.players.length + 1}`,
-      chips: DEFAULT_SETTINGS.startingChips,
-      holeCards: [],
-      currentBet: 0,
-      totalBetThisHand: 0,
-      folded: false,
-      allIn: false,
-      isDealer: this.state.players.length === 0, // First player is dealer
-      sessionToken: newSessionToken,
-    };
-
-    this.state.players.push(newPlayer);
+    const playerName = trimmedName || `Dino${this.getPlayerCount() + 1}`;
+    
+    this.addPlayer(conn.id, playerName, newSessionToken);
     this.connections.set(conn.id, { sessionToken: newSessionToken, playerId: conn.id });
 
-    this.sendToConnection(conn, { 
+    conn.send(JSON.stringify({ 
       type: "welcome", 
       playerId: conn.id,
-      sessionToken: newSessionToken 
-    });
+      sessionToken: newSessionToken,
+      gameType: this.gameType
+    }));
 
-    // Notify all players
     this.room.broadcast(JSON.stringify({
       type: "player-joined",
-      player: {
-        id: newPlayer.id,
-        name: newPlayer.name,
-        chips: newPlayer.chips,
-        currentBet: 0,
-        folded: false,
-        allIn: false,
-        isDealer: newPlayer.isDealer,
-        hasCards: false,
+      player: { id: conn.id, name: playerName, score: 0 }
+    }));
+
+    await this.broadcastState();
+  }
+
+  // --- Game-specific message handlers ---
+
+  private async handlePokerMessage(msg: UnifiedClientMessage, sender: Party.Connection) {
+    if (!this.pokerHandler) return;
+
+    switch (msg.type) {
+      case "start-game": {
+        this.pruneDisconnectedPlayers();
+        const result = await this.pokerHandler.startGame();
+        if (!result.success) {
+          sender.send(JSON.stringify({ type: "error", message: result.error }));
+          return;
+        }
+        await this.broadcastState();
+        break;
       }
-    }));
+      
+      case "action": {
+        const result = await this.pokerHandler.handleAction(sender.id, msg.action);
+        if (!result.success) {
+          sender.send(JSON.stringify({ type: "error", message: result.error }));
+          return;
+        }
+        
+        this.room.broadcast(JSON.stringify({
+          type: "action-taken",
+          playerId: sender.id,
+          action: msg.action,
+        }));
 
+        if (result.showdown) {
+          const state = this.pokerHandler.getState();
+          const winners = state.players.filter(p => !p.folded);
+          if (winners.length > 0) {
+            // Broadcast showdown info
+          }
+        }
+        
+        await this.broadcastState();
+        break;
+      }
+      
+      case "new-hand": {
+        this.pruneDisconnectedPlayers();
+        const result = await this.pokerHandler.handleNewHand();
+        if (!result.success) {
+          sender.send(JSON.stringify({ type: "error", message: result.error }));
+          return;
+        }
+        await this.broadcastState();
+        break;
+      }
+    }
+  }
+
+  private async handlePictionaryMessage(msg: UnifiedClientMessage, sender: Party.Connection) {
+    if (!this.pictionaryHandler) return;
+    await this.pictionaryHandler.handleMessage(msg, sender, this.room);
     await this.broadcastState();
   }
 
-  private async handleStartGame(sender: Party.Connection) {
-    this.pruneDisconnectedSeats();
-
-    if (this.state.phase !== "lobby") {
-      this.sendToConnection(sender, { 
-        type: "error", 
-        message: "Game already started" 
-      });
-      return;
-    }
-
-    if (this.state.players.length < DEFAULT_SETTINGS.minPlayers) {
-      this.sendToConnection(sender, { 
-        type: "error", 
-        message: `Need at least ${DEFAULT_SETTINGS.minPlayers} players` 
-      });
-      return;
-    }
-
-    this.state = startNewHand(this.state);
+  private async handleCodenamesMessage(msg: UnifiedClientMessage, sender: Party.Connection) {
+    if (!this.codenamesHandler) return;
+    await this.codenamesHandler.handleMessage(msg, sender, this.room);
     await this.broadcastState();
   }
 
-  private async handleAction(sender: Party.Connection, action: PlayerAction) {
-    const player = this.state.players.find(p => p.id === sender.id);
-    if (!player) {
-      this.sendToConnection(sender, { type: "error", message: "Not in game" });
-      return;
-    }
+  // --- Helper methods ---
 
-    if (this.state.players[this.state.activePlayerIndex]?.id !== sender.id) {
-      this.sendToConnection(sender, { type: "error", message: "Not your turn" });
-      return;
-    }
-
-    if (this.state.phase === "lobby" || this.state.phase === "showdown") {
-      this.sendToConnection(sender, { type: "error", message: "Cannot act now" });
-      return;
-    }
-
-    // Validate action
-    const legalActions = getLegalActions(this.state);
-    if (!this.isLegalAction(action, legalActions)) {
-      this.sendToConnection(sender, { type: "error", message: "Illegal action" });
-      return;
-    }
-
-    // Apply action
-    this.state = applyAction(this.state, sender.id, action);
-
-    // Broadcast action taken
-    this.room.broadcast(JSON.stringify({
-      type: "action-taken",
-      playerId: sender.id,
-      action,
-    }));
-
-    // Check for phase advancement
-    await this.checkPhaseAdvancement();
-
-    await this.broadcastState();
-  }
-
-  private async handleNewHand(sender: Party.Connection) {
-    if (this.state.phase !== "showdown") {
-      this.sendToConnection(sender, { type: "error", message: "Hand not complete" });
-      return;
-    }
-
-    this.pruneDisconnectedSeats();
-
-    // Remove busted players
-    this.state.players = this.state.players.filter(p => p.chips > 0);
-
-    if (this.state.players.length < DEFAULT_SETTINGS.minPlayers) {
-      // Game over - not enough players
-      this.state = {
-        ...createInitialState(),
-        players: this.state.players,
-      };
-    } else {
-      this.state = startNewHand(this.state);
-    }
-
-    await this.broadcastState();
-  }
-
-  // --- Helper Methods ---
-
-  private isLegalAction(action: PlayerAction, legal: ReturnType<typeof getLegalActions>): boolean {
-    switch (action.type) {
-      case "fold": return legal.canFold;
-      case "check": return legal.canCheck;
-      case "call": return legal.canCall;
-      case "raise":
-        if (!legal.canRaise) return false;
-        if (action.amount === undefined) return true;
-        return Number.isFinite(action.amount) && action.amount === legal.minRaise;
-      case "all-in": return legal.canAllIn;
-      default: return false;
+  private initializeGameHandler(gameType: GameType) {
+    switch (gameType) {
+      case "poker":
+        this.pokerHandler = new PokerGameHandler();
+        break;
+      case "pictionary":
+        this.pictionaryHandler = new PictionaryGameHandler();
+        break;
+      case "codenames":
+        this.codenamesHandler = new CodenamesGameHandler();
+        break;
     }
   }
 
-  private async handleDisconnect(conn: Party.Connection) {
+  private getPlayerCount(): number {
+    switch (this.gameType) {
+      case "poker":
+        return this.pokerHandler?.getPlayerCount() ?? 0;
+      case "pictionary":
+        return this.pictionaryHandler?.getPlayerCount() ?? 0;
+      case "codenames":
+        return this.codenamesHandler?.getPlayerCount() ?? 0;
+      default:
+        return 0;
+    }
+  }
+
+  private canAddPlayer(): boolean {
+    const count = this.getPlayerCount();
+    switch (this.gameType) {
+      case "poker":
+        return count < DEFAULT_SETTINGS.maxPlayers;
+      case "pictionary":
+        return count < 8;
+      case "codenames":
+        return count < 4;
+      default:
+        return false;
+    }
+  }
+
+  private isInLobby(): boolean {
+    switch (this.gameType) {
+      case "poker":
+        return this.pokerHandler?.isInLobby() ?? true;
+      case "pictionary":
+        return this.pictionaryHandler?.isInLobby() ?? true;
+      case "codenames":
+        return this.codenamesHandler?.isInLobby() ?? true;
+      default:
+        return true;
+    }
+  }
+
+  private isNameTaken(name: string): boolean {
+    switch (this.gameType) {
+      case "poker":
+        return this.pokerHandler?.getState().players.some(p => p.name === name) ?? false;
+      case "pictionary":
+        return this.pictionaryHandler?.isNameTaken(name) ?? false;
+      case "codenames":
+        return this.codenamesHandler?.isNameTaken(name) ?? false;
+      default:
+        return false;
+    }
+  }
+
+  private findPlayerByToken(token: string): BasePlayer | Player | null {
+    switch (this.gameType) {
+      case "poker":
+        return this.pokerHandler?.getPlayerByToken(token) ?? null;
+      case "pictionary":
+        return this.pictionaryHandler?.getPlayerByToken(token) ?? null;
+      case "codenames":
+        return this.codenamesHandler?.getPlayerByToken(token) ?? null;
+      default:
+        return null;
+    }
+  }
+
+  private updatePlayerId(token: string, newId: string): void {
+    switch (this.gameType) {
+      case "poker": {
+        const player = this.pokerHandler?.getPlayerByToken(token);
+        if (player) player.id = newId;
+        break;
+      }
+      case "pictionary":
+        this.pictionaryHandler?.updatePlayerId(token, newId);
+        break;
+      case "codenames":
+        this.codenamesHandler?.updatePlayerId(token, newId);
+        break;
+    }
+  }
+
+  private addPlayer(id: string, name: string, sessionToken: string): void {
+    switch (this.gameType) {
+      case "poker": {
+        const newPlayer: Player = {
+          id,
+          name,
+          chips: DEFAULT_SETTINGS.startingChips,
+          holeCards: [],
+          currentBet: 0,
+          totalBetThisHand: 0,
+          folded: false,
+          allIn: false,
+          isDealer: this.pokerHandler?.getPlayerCount() === 0,
+          sessionToken,
+        };
+        this.pokerHandler?.addPlayer(newPlayer);
+        break;
+      }
+      case "pictionary":
+        this.pictionaryHandler?.addPlayer(id, name, sessionToken);
+        break;
+      case "codenames":
+        this.codenamesHandler?.addPlayer(id, name, sessionToken);
+        break;
+    }
+  }
+
+  private handleDisconnect(conn: Party.Connection): void {
     this.connections.delete(conn.id);
-
-    const playerIndex = this.state.players.findIndex(p => p.id === conn.id);
-    if (playerIndex === -1) return;
-    if (this.state.phase === "lobby" || this.state.phase === "showdown") {
-      this.removePlayerSeat(conn.id);
-      this.room.broadcast(JSON.stringify({ type: "player-left", playerId: conn.id }));
-      await this.broadcastState();
-      return;
-    }
-
-    const disconnectedPlayer = this.state.players[playerIndex];
-    if (disconnectedPlayer.folded || disconnectedPlayer.allIn) return;
-
-    if (playerIndex === this.state.activePlayerIndex) {
-      this.state = applyAction(this.state, disconnectedPlayer.id, { type: "fold" });
-    } else {
-      const players = [...this.state.players];
-      players[playerIndex] = { ...players[playerIndex], folded: true };
-      this.state = { ...this.state, players };
-    }
-
-    await this.checkPhaseAdvancement();
-    await this.broadcastState();
-  }
-
-  private pruneDisconnectedSeats() {
-    const connectedIds = new Set(Array.from(this.room.getConnections(), conn => conn.id));
-    const disconnectedPlayerIds = this.state.players
-      .filter(player => !connectedIds.has(player.id))
-      .map(player => player.id);
-
-    for (const playerId of disconnectedPlayerIds) {
-      this.removePlayerSeat(playerId);
-    }
-  }
-
-  private removePlayerSeat(playerId: string) {
-    const removedIndex = this.state.players.findIndex(player => player.id === playerId);
-    if (removedIndex === -1) return;
-
-    const players = [...this.state.players];
-    players.splice(removedIndex, 1);
-
-    let dealerIndex = this.state.dealerIndex;
-    if (players.length === 0) {
-      dealerIndex = 0;
-    } else if (removedIndex < dealerIndex) {
-      dealerIndex -= 1;
-    } else if (removedIndex === dealerIndex) {
-      dealerIndex = dealerIndex % players.length;
-    }
-
-    let activePlayerIndex = this.state.activePlayerIndex;
-    if (players.length === 0) {
-      activePlayerIndex = 0;
-    } else if (removedIndex < activePlayerIndex) {
-      activePlayerIndex -= 1;
-    } else if (removedIndex === activePlayerIndex) {
-      activePlayerIndex = activePlayerIndex % players.length;
-    }
-
-    let lastRaiserIndex = this.state.lastRaiserIndex;
-    if (players.length === 0) {
-      lastRaiserIndex = -1;
-    } else if (lastRaiserIndex >= 0) {
-      if (removedIndex < lastRaiserIndex) {
-        lastRaiserIndex -= 1;
-      } else if (removedIndex === lastRaiserIndex) {
-        lastRaiserIndex = -1;
-      }
-    }
-
-    const normalizedPlayers = players.map((player, index) => ({
-      ...player,
-      isDealer: players.length > 0 && index === dealerIndex,
-    }));
-
-    this.state = {
-      ...this.state,
-      players: normalizedPlayers,
-      dealerIndex,
-      activePlayerIndex,
-      lastRaiserIndex,
-    };
-  }
-
-  private async checkPhaseAdvancement() {
-    // Check if only one player left (everyone else folded)
-    if (countActivePlayers(this.state) <= 1) {
-      await this.runShowdownAndBroadcast();
-      return;
-    }
-
-    // Check if betting round is complete
-    if (shouldAdvancePhase(this.state)) {
-      // Check for all-in showdown
-      if (shouldAutoShowdown(this.state)) {
-        this.state = runOutBoard(this.state);
-        await this.runShowdownAndBroadcast();
-        return;
-      }
-
-      // Advance to next street
-      if (this.state.phase === "river") {
-        await this.runShowdownAndBroadcast();
-      } else {
-        this.state = advanceStreet(this.state);
-      }
-    }
-  }
-
-  private async runShowdownAndBroadcast() {
-    const { results, winnings, updatedPlayers } = await runShowdown(this.state);
     
-    this.state = {
-      ...this.state,
-      phase: "showdown",
-      players: updatedPlayers,
-    };
+    switch (this.gameType) {
+      case "poker":
+        this.pokerHandler?.handleDisconnect(conn.id);
+        break;
+      case "pictionary":
+        this.pictionaryHandler?.handleDisconnect(conn.id);
+        break;
+      case "codenames":
+        this.codenamesHandler?.handleDisconnect(conn.id);
+        break;
+    }
 
-    // Broadcast showdown results
-    this.room.broadcast(JSON.stringify({
-      type: "showdown",
-      results,
-    }));
+    this.room.broadcast(JSON.stringify({ type: "player-left", playerId: conn.id }));
+    this.broadcastState();
+  }
 
-    // Also send hand-complete for simple display
-    const winners = results.filter(r => r.isWinner);
-    if (winners.length > 0) {
-      const mainWinner = winners[0];
-      this.room.broadcast(JSON.stringify({
-        type: "hand-complete",
-        winnerId: mainWinner.playerId,
-        winnerName: mainWinner.name,
-        handName: mainWinner.handName,
-        dinoHandName: mainWinner.dinoHandName,
-        potAmount: mainWinner.potWon,
-      }));
+  private pruneDisconnectedPlayers(): void {
+    const connectedIds = new Set(Array.from(this.room.getConnections(), conn => conn.id));
+    
+    switch (this.gameType) {
+      case "poker": {
+        const state = this.pokerHandler?.getState();
+        if (state) {
+          const disconnected = state.players.filter(p => !connectedIds.has(p.id));
+          for (const player of disconnected) {
+            this.pokerHandler?.removePlayer(player.id);
+          }
+        }
+        break;
+      }
+      case "pictionary":
+        this.pictionaryHandler?.pruneDisconnected(connectedIds);
+        break;
+      case "codenames":
+        this.codenamesHandler?.pruneDisconnected(connectedIds);
+        break;
     }
   }
 
-  private async broadcastState() {
-    const publicState = toPublicState(this.state);
-
-    // Send state to each player with their private cards
+  private async broadcastState(): Promise<void> {
     for (const conn of this.room.getConnections()) {
-      const player = this.state.players.find(p => p.id === conn.id);
-      const legalActions = player && this.state.players[this.state.activePlayerIndex]?.id === conn.id
-        ? getLegalActions(this.state)
-        : undefined;
-
-      const message: ServerMessage = {
-        type: "game-state",
-        state: publicState,
-        yourCards: player?.holeCards,
-        legalActions,
-      };
-
-      conn.send(JSON.stringify(message));
+      const state = this.getStateForConnection(conn.id);
+      if (state) {
+        conn.send(JSON.stringify(state));
+      }
     }
   }
 
-  private sendToConnection(conn: Party.Connection, message: ServerMessage) {
-    conn.send(JSON.stringify(message));
+  private getStateForConnection(connId: string): object | null {
+    switch (this.gameType) {
+      case "poker": {
+        if (!this.pokerHandler) return null;
+        const publicState = this.pokerHandler.getPublicState();
+        const player = this.pokerHandler.getPlayer(connId);
+        const legalActions = this.pokerHandler.getLegalActionsForPlayer(connId);
+        return {
+          type: "game-state",
+          gameType: "poker",
+          state: publicState,
+          yourCards: player?.holeCards,
+          legalActions,
+        };
+      }
+      case "pictionary": {
+        if (!this.pictionaryHandler) return null;
+        return this.pictionaryHandler.getStateForConnection(connId);
+      }
+      case "codenames": {
+        if (!this.codenamesHandler) return null;
+        return this.codenamesHandler.getStateForConnection(connId);
+      }
+      default:
+        return null;
+    }
   }
 }
 
-DinoPokerServer satisfies Party.Worker;
+DinoGamesServer satisfies Party.Worker;
